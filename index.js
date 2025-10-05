@@ -1,101 +1,131 @@
-const express = require("express");
-const TelegramBot = require("node-telegram-bot-api");
-const ytdl = require("ytdl-core");
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("ffmpeg-static");
-const fs = require("fs");
+import { Telegraf, Markup } from "telegraf";
+import mongoose from "mongoose";
+import express from "express";
+import dotenv from "dotenv";
+import User from "./models/user.js";
+import Service from "./models/service.js";
 
-ffmpeg.setFfmpegPath(ffmpegPath);
+dotenv.config();
 
+const bot = new Telegraf(process.env.BOT_TOKEN);
 const app = express();
-const bot = new TelegramBot(process.env.BOT_TOKEN, { polling: true });
 
-app.get("/", (req, res) => res.send("Bot is alive 🚀"));
+// 🔥 Express Server (Render + UptimeRobot Ping)
+app.get("/", (req, res) => res.send("Bot is Running... ✅"));
+app.listen(process.env.PORT || 3000, () => console.log("🌐 Webserver started"));
 
-bot.onText(/\/start/, (msg) => {
-  bot.sendMessage(
-    msg.chat.id,
-    `👋 Hi ${msg.from.first_name}!
-🎥 Send me a YouTube link with one of these commands:
+// 🧩 MongoDB Connect
+mongoose.connect(process.env.MONGO_URL)
+  .then(() => console.log("✅ MongoDB Connected"))
+  .catch(err => console.log("❌ Mongo Error:", err));
 
-🎧 /mp3 <url> — get audio
-🎬 /mp4 <url> — get video`
-  );
+// 💬 Start Command
+bot.start(async (ctx) => {
+  const userId = ctx.from.id;
+  let user = await User.findOne({ userId });
+  if (!user) {
+    user = await User.create({ userId });
+    if (ctx.startPayload) {
+      user.referral = ctx.startPayload;
+      await user.save();
+    }
+  }
+
+  const menu = Markup.inlineKeyboard([
+    [Markup.button.callback("🛒 New Order", "new_order")],
+    [Markup.button.callback("💰 My Balance", "balance")],
+    [Markup.button.callback("📦 My Orders", "orders")],
+    [Markup.button.callback("👥 Referral", "referral")]
+  ]);
+
+  await ctx.reply(`👋 Welcome ${ctx.from.first_name}!\n\nUse the menu below:`, menu);
 });
 
-// MP3 downloader
-bot.onText(/\/mp3 (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const url = match[1];
+// 💰 Balance Menu
+bot.action("balance", async (ctx) => {
+  await ctx.answerCbQuery();
+  const user = await User.findOne({ userId: ctx.from.id });
+  const menu = Markup.inlineKeyboard([
+    [Markup.button.callback("➕ Deposit", "deposit")]
+  ]);
+  await ctx.editMessageText(`💰 Your Balance: ₹${user.balance}\n\n`, menu);
+});
 
-  if (!ytdl.validateURL(url))
-    return bot.sendMessage(chatId, "❌ Invalid YouTube link!");
-
-  const info = await ytdl.getInfo(url);
-  const title = info.videoDetails.title.replace(/[^\w\s]/gi, "_");
-  const output = `${title}.mp3`;
-
-  bot.sendMessage(chatId, "🎧 Downloading and converting to MP3...");
-
-  const stream = ytdl(url, { filter: "audioonly", quality: "highestaudio" });
-
-  ffmpeg(stream)
-    .audioBitrate(128)
-    .toFormat("mp3")
-    .save(output)
-    .on("end", async () => {
-      await bot.sendAudio(chatId, output, { title: info.videoDetails.title });
-      fs.unlinkSync(output);
-    })
-    .on("error", (err) => {
-      console.error(err);
-      bot.sendMessage(chatId, "⚠️ Error while processing audio!");
+// 💸 Deposit System (Simulation)
+bot.action("deposit", async (ctx) => {
+  await ctx.answerCbQuery();
+  await ctx.reply("💵 Enter amount to deposit (minimum ₹50):");
+  bot.once("text", async (ctx2) => {
+    const amt = parseInt(ctx2.message.text);
+    if (amt < 50) return ctx2.reply("❌ Minimum deposit ₹50!");
+    await ctx2.reply("📸 Send your payment transaction ID (12 digits only):");
+    bot.once("text", async (ctx3) => {
+      const txid = ctx3.message.text;
+      if (!/^\d{12}$/.test(txid)) return ctx3.reply("❌ Invalid Transaction ID!");
+      // Send to Admin for approval
+      await bot.telegram.sendMessage(process.env.ADMIN_ID,
+        `💰 Deposit Request\n👤 User: ${ctx2.from.first_name} (${ctx2.from.id})\n💵 Amount: ₹${amt}\n🆔 TXID: ${txid}`,
+        Markup.inlineKeyboard([
+          [Markup.button.callback(`✅ Approve ₹${amt}`, `approve_${ctx2.from.id}_${amt}`)]
+        ])
+      );
+      ctx3.reply("✅ Deposit request sent to admin!");
     });
+  });
 });
 
-// MP4 downloader
-bot.onText(/\/mp4 (.+)/, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const url = match[1];
+// 👑 Admin Deposit Approval
+bot.action(/approve_(\d+)_(\d+)/, async (ctx) => {
+  const [_, userId, amt] = ctx.match;
+  const user = await User.findOne({ userId });
+  user.balance += Number(amt);
+  user.deposits.push({ amt, date: new Date() });
+  await user.save();
+  await ctx.reply(`✅ Approved ₹${amt} for user ${userId}`);
+  await bot.telegram.sendMessage(userId, `🎉 ₹${amt} added to your balance!`);
+});
 
-  if (!ytdl.validateURL(url))
-    return bot.sendMessage(chatId, "❌ Invalid YouTube link!");
+// ⚙️ Set Service (Admin Only)
+bot.command("setservice", async (ctx) => {
+  if (ctx.from.id != process.env.ADMIN_ID) return;
+  const parts = ctx.message.text.split(" ");
+  const [cmd, name, apiLink, price] = parts;
+  if (!name || !apiLink || !price) return ctx.reply("Usage: /setservice name apilink pricePer1k");
+  await Service.findOneAndUpdate({ name }, { apiLink, pricePer1k: price }, { upsert: true });
+  ctx.reply(`✅ Service ${name} set with ₹${price}/1k`);
+});
 
-  const info = await ytdl.getInfo(url);
-  const title = info.videoDetails.title.replace(/[^\w\s]/gi, "_");
-  const output = `${title}.mp4`;
+// 🛍️ New Order
+bot.action("new_order", async (ctx) => {
+  await ctx.answerCbQuery();
+  const services = await Service.find();
+  if (!services.length) return ctx.reply("❌ No service available yet.");
+  const buttons = services.map(s => [Markup.button.callback(`${s.name} - ₹${s.pricePer1k}/1k`, `service_${s.name}`)]);
+  await ctx.reply("🛍️ Choose a service:", Markup.inlineKeyboard(buttons));
+});
 
-  bot.sendMessage(chatId, "🎬 Downloading video, please wait...");
-
-  const stream = ytdl(url, { quality: "18" }); // 360p stable stream
-
-  stream
-    .pipe(fs.createWriteStream(output))
-    .on("finish", async () => {
-      const stats = fs.statSync(output);
-      const fileSizeMB = stats.size / (1024 * 1024);
-
-      if (fileSizeMB <= 50) {
-        await bot.sendVideo(chatId, output, {
-          caption: `🎬 ${info.videoDetails.title}`,
-        });
-      } else {
-        bot.sendMessage(
-          chatId,
-          `⚠️ Video too large (${fileSizeMB.toFixed(
-            1
-          )} MB). Telegram limit is 50MB!`
-        );
-      }
-
-      fs.unlinkSync(output);
-    })
-    .on("error", (err) => {
-      console.error(err);
-      bot.sendMessage(chatId, "⚠️ Error while downloading video!");
+// 📦 Handle service order
+bot.action(/service_(.+)/, async (ctx) => {
+  const name = ctx.match[1];
+  const service = await Service.findOne({ name });
+  await ctx.reply(`📎 Send your post link for ${name}:`);
+  bot.once("text", async (ctx2) => {
+    const link = ctx2.message.text;
+    await ctx2.reply("📊 Enter quantity (min 500, max 1000000):");
+    bot.once("text", async (ctx3) => {
+      const qty = parseInt(ctx3.message.text);
+      if (qty < 500 || qty > 1000000) return ctx3.reply("❌ Invalid quantity!");
+      const cost = (service.pricePer1k / 1000) * qty;
+      const user = await User.findOne({ userId: ctx3.from.id });
+      if (user.balance < cost) return ctx3.reply("❌ Not enough balance!");
+      user.balance -= cost;
+      user.orders.push({ service: name, link, qty, cost, date: new Date() });
+      await user.save();
+      ctx3.reply(`✅ Order placed!\n\n📦 Service: ${name}\n🔗 Link: ${link}\n💰 Cost: ₹${cost}`);
     });
+  });
 });
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log("✅ Bot server running...")
-);
+// ✅ Launch bot
+bot.launch();
+console.log("🤖 Bot started successfully!");
